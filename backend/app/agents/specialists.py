@@ -157,25 +157,57 @@ class RefundAgent(Agent):
         try:
             v = ctx.get("verification", {}); res = ctx.get("resolutionDecision", {})
             risk = ctx.get("riskAssessment", {}); t = ctx.get("transaction", {})
+            checks = (v.get("checks") or {}) if isinstance(v, dict) else {}
+            try:
+                within_limit = float(t.get("amount", 0)) <= float(settings.AUTO_REFUND_LIMIT)
+            except (TypeError, ValueError):
+                within_limit = False
             allowed = (v.get("verification") == "PASSED" and res.get("decision") == "REFUND"
-                       and risk.get("automaticResolutionAllowed") is True)
+                       and res.get("automaticActionAllowed") is True
+                       and risk.get("automaticResolutionAllowed") is True
+                       and checks.get("no_existing_refund", True) is True
+                       and checks.get("within_limit", within_limit) is True
+                       and within_limit
+                       and not t.get("refundExists"))
             if not allowed:
                 HumanEscalationTool.run(db, case_id, "Refund attempted without verification — blocked by safety gate.")
                 return self._finish(db, case_id, ex, {"blocked": True}, RefundExecutionTool.name, "FAILED",
                                     "Safety gate blocked refund")
+            if not t.get("transactionId") or t.get("amount") is None:
+                return self._finish(db, case_id, ex, {"blocked": True}, RefundExecutionTool.name, "FAILED",
+                                    "Missing transaction context")
             desc = ctx.get("description", "").lower()
             force_fail = ("gateway fail" in desc or "refund fail" in desc) or ctx.get("transaction_id") == "TXN-DEMO-005"
-            # retry loop
+            # retry loop (FAILED idempotent rows stay FAILED — do not spin forever)
             last = None
             for attempt in range(1, settings.MAX_REFUND_RETRIES + 1):
                 last = RefundExecutionTool.run(db, case_id, t["transactionId"], t["amount"],
                                                "INR", force_fail=force_fail)
                 if last["status"] == "SUCCESS" or last.get("idempotent_replay"):
                     break
+                if last.get("failure_reason") in ("Transaction not found", "Amount mismatch"):
+                    break
             out = {"refundId": last["refund_id"], "transactionId": t["transactionId"],
                    "amount": last["amount"], "status": last["status"],
                    "timestamp": __import__("datetime").datetime.utcnow().isoformat()}
             ctx["refund"] = out
+            # Synthetic refund txn counted in history: "Refunded to Bank"
+            if out["status"] == "SUCCESS":
+                try:
+                    orig = db.query(models.Transaction).filter_by(transaction_id=t["transactionId"]).first()
+                    synth_id = f"{t['transactionId']}-RFND"
+                    if orig and not db.query(models.Transaction).filter_by(transaction_id=synth_id).first():
+                        import random as _r
+                        db.add(models.Transaction(
+                            transaction_id=synth_id, user_id=orig.user_id,
+                            merchant_name="Refunded to Bank", amount=orig.amount,
+                            status="SUCCESS", debited=False, merchant_credited=False,
+                            settlement_status="REFUNDED", payment_method=orig.payment_method,
+                            sender_masked=orig.sender_masked,
+                            utr_number=f"UTR{''.join(str(_r.randint(0,9)) for _ in range(12))}"))
+                        db.commit()
+                except Exception:
+                    db.rollback()
             st = "COMPLETED" if out["status"] == "SUCCESS" else "FAILED"
             return self._finish(db, case_id, ex, out, RefundExecutionTool.name, st,
                                 "" if st == "COMPLETED" else last.get("failure_reason", "gateway failure"))
